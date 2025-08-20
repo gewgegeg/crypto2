@@ -1,85 +1,33 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import time
-from typing import Dict, List, Optional, Set, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Set
 
 from rich.console import Console
 from rich.live import Live
-from rich.table import Table
 
-from arbitrage.connectors.cex import CcxtCexClient
-from arbitrage.models import OrderBook
-from arbitrage.services.universe import get_cmc_top_bases
+from arbitrage.services.mega_core import (
+    build_exchanges,
+    load_spot_symbols,
+    filter_symbols,
+    get_bases_from_preset,
+    scan_symbols_once,
+)
 
 
 DEFAULT_EXCHANGES: List[str] = [
     "okx", "kraken", "kucoin", "gate", "bitget", "mexc", "coinex", "poloniex",
     "lbank", "xt", "whitebit", "bitmart", "phemex", "btse", "ascendex", "probit",
-    "digifinex", "bittrex", "hitbtc", "huobi", "bitstamp", "bitvavo", "upbit",
-    "bitrue", "bkex", "bybit", "binance", "bingx", "deepcoin", "xts", "zb",
-    "coinone", "korbit", "bitfinex", "indodax", "wazirx", "okcoin", "coincheck",
-    "coinsph", "tidex", "paribu",
+    "digifinex", "bittrex", "hitbtc", "huobi", "bitstamp", "bitvavo", "bitrue", "bkex",
+    "deepcoin", "zb", "coinone", "korbit", "bitfinex", "indodax", "wazirx", "okcoin",
+    "coincheck", "coinsph", "tidex", "paribu",
 ]
-# Some may be region-blocked or not available; scanner skips on errors
-
-STABLES: Set[str] = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI"}
 
 
-def build_exchanges(ids: List[str], exclude: Set[str]) -> Dict[str, CcxtCexClient]:
-    clients: Dict[str, CcxtCexClient] = {}
-    for ex_id in ids:
-        if ex_id in exclude:
-            continue
-        try:
-            clients[ex_id] = CcxtCexClient(ex_id)
-        except Exception:
-            continue
-    return clients
-
-
-def load_spot_symbols(client: CcxtCexClient) -> Set[str]:
-    try:
-        markets = client.client.load_markets()
-        return {s for s, m in markets.items() if m.get("spot")}
-    except Exception:
-        return set()
-
-
-def filter_symbols(
-    symbols: Set[str],
-    quotes: Optional[Set[str]],
-    bases_allow: Optional[Set[str]],
-    skip_pure_stables: bool,
-) -> Set[str]:
-    out: Set[str] = set()
-    for s in symbols:
-        try:
-            base, quote = s.split("/")
-        except Exception:
-            continue
-        if skip_pure_stables and base in STABLES and quote in STABLES:
-            continue
-        if quotes and (quotes != {"ANY"} and quotes != {"*"}) and quote not in quotes:
-            continue
-        if bases_allow and base not in bases_allow:
-            continue
-        out.add(s)
-    return out
-
-
-def fetch_best_levels(client: CcxtCexClient, symbol: str) -> Tuple[Optional[float], Optional[float]]:
-    try:
-        ob: OrderBook = client.fetch_order_book(symbol, limit=10)
-        best_ask = ob.asks[0].price if ob.asks else None
-        best_bid = ob.bids[0].price if ob.bids else None
-        return best_ask, best_bid
-    except Exception:
-        return None, None
-
-
-def build_table(rows: List[Tuple[str, str, float, str, float, float, float]]) -> Table:
+def build_table(rows):
+    from rich.table import Table
     table = Table(title="Multi-Exchange Arbitrage Scanner")
     table.add_column("Symbol")
     table.add_column("Best Ask Ex")
@@ -93,6 +41,16 @@ def build_table(rows: List[Tuple[str, str, float, str, float, float, float]]) ->
     return table
 
 
+def maybe_export_csv(path: Optional[str], rows) -> None:
+    if not path:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["symbol", "ask_exchange", "ask", "bid_exchange", "bid", "roi_pct", "profit"])
+        for r in rows:
+            w.writerow(r)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Scan arbitrage across many exchanges and symbols")
     parser.add_argument("--ex-list", default=",".join(DEFAULT_EXCHANGES), help="Comma-separated exchange ids (ccxt)")
@@ -103,11 +61,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--limit-symbols", type=int, default=500, help="Limit number of symbols to scan")
     parser.add_argument("--size", type=float, default=1000.0, help="Quote size to simulate profit")
     parser.add_argument("--threshold", type=float, default=0.5, help="Min ROI percent to display")
-    parser.add_argument("--min-volume", type=float, default=0.0, help="Reserved for future per-ex volume filter")
+    parser.add_argument("--min-volume", type=float, default=0.0, help="Min 24h quote volume on both exchanges")
     parser.add_argument("--interval", type=float, default=4.0, help="Refresh seconds")
     parser.add_argument("--top", type=int, default=50, help="Top rows by ROI")
     parser.add_argument("--workers", type=int, default=32, help="Max parallel requests")
     parser.add_argument("--skip-stables", action="store_true", help="Skip pure stable-stable pairs")
+    parser.add_argument("--export", default="", help="Export last snapshot to CSV path")
+    parser.add_argument("--enforce-lots", action="store_true", help="Respect min lot and min cost per exchange")
 
     args = parser.parse_args(argv)
     console = Console()
@@ -119,12 +79,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     bases_allow: Optional[Set[str]] = None
     if args.bases:
         bases_allow = {b.strip().upper() for b in args.bases.split(",") if b.strip()}
-    elif args.preset.startswith("CMC_TOP"):
-        try:
-            topn = int(args.preset.replace("CMC_TOP", ""))
-        except Exception:
-            topn = 100
-        bases_allow = set(get_cmc_top_bases(limit=topn))
+    else:
+        bases_allow = get_bases_from_preset(args.preset)
 
     console.print(f"Building {len(ex_list)} exchanges (excluding: {', '.join(sorted(exclude)) or 'none'})...")
     clients = build_exchanges(ex_list, exclude)
@@ -132,12 +88,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         console.print("No exchanges available")
         return 1
 
-    # Load symbols per exchange
     ex_symbols: Dict[str, Set[str]] = {}
     for ex_id, client in clients.items():
         ex_symbols[ex_id] = filter_symbols(load_spot_symbols(client), quotes, bases_allow, args.skip_stables)
 
-    # Candidate symbols: present on >= 2 exchanges
     symbol_counts: Dict[str, int] = {}
     for syms in ex_symbols.values():
         for s in syms:
@@ -148,45 +102,24 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     console.print(f"Scanning {len(symbols)} symbols across {len(clients)} exchanges...")
 
+    last_rows = []
     with Live(build_table([]), refresh_per_second=4, console=console) as live:
         while True:
-            rows: List[Tuple[str, str, float, str, float, float, float]] = []
-            for sym in symbols:
-                # fetch best levels across exchanges in parallel
-                futures = {}
-                with ThreadPoolExecutor(max_workers=args.workers) as pool:
-                    for ex_id, client in clients.items():
-                        if sym not in ex_symbols.get(ex_id, set()):
-                            continue
-                        futures[pool.submit(fetch_best_levels, client, sym)] = ex_id
-                    best_ask_val: Optional[float] = None
-                    best_ask_ex: Optional[str] = None
-                    best_bid_val: Optional[float] = None
-                    best_bid_ex: Optional[str] = None
-                    for fut in as_completed(futures):
-                        ex_id = futures[fut]
-                        ask, bid = fut.result()
-                        if ask is not None and (best_ask_val is None or ask < best_ask_val):
-                            best_ask_val = ask
-                            best_ask_ex = ex_id
-                        if bid is not None and (best_bid_val is None or bid > best_bid_val):
-                            best_bid_val = bid
-                            best_bid_ex = ex_id
-                if best_ask_val is None or best_bid_val is None:
-                    continue
-                if best_ask_ex == best_bid_ex:
-                    continue
-                # ROI and profit
-                cost = args.size
-                base_amount = cost / best_ask_val
-                proceeds = best_bid_val * base_amount
-                profit = proceeds - cost
-                roi = 100.0 * profit / cost if cost > 0 else 0.0
-                if roi >= args.threshold:
-                    rows.append((sym, best_ask_ex or "?", best_ask_val, best_bid_ex or "?", best_bid_val, roi, profit))
+            rows = scan_symbols_once(
+                clients=clients,
+                ex_symbols=ex_symbols,
+                symbols=symbols,
+                size=args.size,
+                threshold=args.threshold,
+                workers=args.workers,
+                min_volume=args.min_volume,
+                enforce_lots=args.enforce_lots,
+            )
             rows.sort(key=lambda r: r[5], reverse=True)
-            rows = rows[: args.top]
-            live.update(build_table(rows))
+            last_rows = rows[: args.top]
+            live.update(build_table(last_rows))
+            if args.export:
+                maybe_export_csv(args.export, last_rows)
             time.sleep(args.interval)
 
 
