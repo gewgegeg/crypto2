@@ -51,6 +51,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--threshold", type=float, default=None, help="Min ROI %% to notify")
     parser.add_argument("--mock", action="store_true", help="Use mock data")
     parser.add_argument("--live", action="store_true", help="Use live APIs (overrides --mock)")
+    parser.add_argument("--ex-a", dest="ex_a", default=None, help="Primary CEX id (ccxt id), e.g., okx")
+    parser.add_argument("--ex-b", dest="ex_b", default=None, help="Secondary CEX id (ccxt id), e.g., kraken")
 
     args = parser.parse_args(argv)
     settings = get_settings()
@@ -61,6 +63,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         settings.trade_size_usdt = args.size
     if args.threshold is not None:
         settings.spread_threshold_pct = args.threshold
+    if args.ex_a:
+        settings.exchange_a = args.ex_a
+    if args.ex_b:
+        settings.exchange_b = args.ex_b
     if args.live:
         settings.use_mock_data = False
     elif args.mock:
