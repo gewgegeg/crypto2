@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 from rich.live import Live
 from rich.table import Table
@@ -11,23 +11,47 @@ from rich.console import Console
 from arbitrage.connectors.cex import CcxtCexClient
 from arbitrage.strategies import find_cex_cex_opportunity
 from arbitrage.models import OrderBook
+from arbitrage.services.universe import get_cmc_top_bases
 
 
-def find_common_symbols(ex_a: CcxtCexClient, ex_b: CcxtCexClient, quote: Optional[str]) -> List[str]:
+STABLES: Set[str] = {"USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI"}
+
+
+def find_common_symbols(
+    ex_a: CcxtCexClient,
+    ex_b: CcxtCexClient,
+    quotes: Optional[List[str]],
+    bases_allow: Optional[Set[str]] = None,
+    skip_stables: bool = True,
+) -> List[str]:
     a_markets = ex_a.client.load_markets()
     b_markets = ex_b.client.load_markets()
     a_syms = {s for s, m in a_markets.items() if m.get("spot")}
     b_syms = {s for s, m in b_markets.items() if m.get("spot")}
     common = a_syms & b_syms
-    if quote and quote.upper() not in {"ANY", "*"}:
-        common = {s for s in common if s.endswith(f"/{quote}")}
-    return sorted(common)
+
+    def keep_symbol(sym: str) -> bool:
+        try:
+            base, quote = sym.split("/")
+        except Exception:
+            return False
+        if skip_stables and (base in STABLES or quote in STABLES and (quotes and len(quotes) > 1)):
+            # If scanning many quotes, let stable quotes pass; only drop pure stable pairs
+            if base in STABLES and quote in STABLES:
+                return False
+        if quotes and quotes != ["ANY"] and quotes != ["*"] and quote not in quotes:
+            return False
+        if bases_allow and base not in bases_allow:
+            return False
+        return True
+
+    filtered = [s for s in common if keep_symbol(s)]
+    return sorted(filtered)
 
 
 def fetch_quote_volumes(exchange: CcxtCexClient, symbols: List[str]) -> Dict[str, float]:
     volumes: Dict[str, float] = {}
     try:
-        # Try batched fetch_tickers if supported
         tickers = None
         try:
             tickers = exchange.client.fetch_tickers(symbols)
@@ -63,14 +87,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Multi-symbol live arbitrage scanner")
     parser.add_argument("--ex-a", required=True, help="Primary CEX id (ccxt id), e.g., okx")
     parser.add_argument("--ex-b", required=True, help="Secondary CEX id (ccxt id), e.g., kraken")
-    parser.add_argument("--quote", default="USDT", help="Quote currency to filter symbols (e.g., USDT). Use ANY for all")
-    parser.add_argument("--limit", type=int, default=50, help="Max number of symbols to scan")
+    parser.add_argument("--quotes", default="USDT", help="Comma-separated quote list (e.g., USDT,USD,USDC) or ANY for all")
+    parser.add_argument("--bases", default="", help="Comma-separated base list to include (e.g., BTC,ETH). If empty, use preset")
+    parser.add_argument("--preset", default="CMC_TOP50", help="Universe preset: CMC_TOPN (e.g., CMC_TOP50) or NONE")
+    parser.add_argument("--limit", type=int, default=200, help="Max number of symbols to scan")
     parser.add_argument("--size", type=float, default=1000.0, help="Trade size in quote to simulate profit")
     parser.add_argument("--threshold", type=float, default=0.5, help="Min ROI percent to display")
     parser.add_argument("--interval", type=float, default=3.0, help="Refresh interval seconds")
     parser.add_argument("--transfer-fee", type=float, default=0.0, help="Transfer fee in base units")
     parser.add_argument("--min-volume", type=float, default=0.0, help="Min 24h quote volume to include (per exchange)")
-    parser.add_argument("--top", type=int, default=30, help="Show top-N rows by ROI")
+    parser.add_argument("--top", type=int, default=50, help="Show top-N rows by ROI")
+    parser.add_argument("--skip-stables", action="store_true", help="Skip pure stablecoin pairs")
 
     args = parser.parse_args(argv)
 
@@ -78,8 +105,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     ex_a = CcxtCexClient(args.ex_a)
     ex_b = CcxtCexClient(args.ex_b)
 
+    quotes = [q.strip().upper() for q in args.quotes.split(",")] if args.quotes else ["USDT"]
+
+    bases_allow: Optional[Set[str]] = None
+    if args.bases:
+        bases_allow = {b.strip().upper() for b in args.bases.split(",") if b.strip()}
+    elif args.preset.startswith("CMC_TOP"):
+        try:
+            topn = int(args.preset.replace("CMC_TOP", ""))
+        except Exception:
+            topn = 50
+        bases_allow = set(get_cmc_top_bases(limit=topn))
+
     console.print(f"Loading markets for {args.ex_a} and {args.ex_b}...")
-    symbols = find_common_symbols(ex_a, ex_b, args.quote)
+    symbols = find_common_symbols(ex_a, ex_b, quotes, bases_allow=bases_allow, skip_stables=args.skip_stables)
     if not symbols:
         console.print("No common symbols found")
         return 1
